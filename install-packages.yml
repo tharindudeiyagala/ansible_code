@@ -1,0 +1,268 @@
+---
+- name: Configure Nginx PHP 8.5 and Supervisor on EC2
+  hosts: ec2_servers
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    php_version: "8.5"
+    application_user: layoutindex
+    application_group: layoutindex
+    controller_ssh_public_key_file: "~/.ssh/ansible_ec2.pub"
+    php_pool_conf: "/etc/php/{{ php_version }}/fpm/pool.d/www.conf"
+    nginx_conf: /etc/nginx/nginx.conf
+
+  pre_tasks:
+  - name: Require Ubuntu 24.04
+    ansible.builtin.assert:
+      that:
+      - ansible_facts['distribution'] == 'Ubuntu'
+      - ansible_facts['distribution_version'] == '24.04'
+      fail_msg: "This playbook expects Ubuntu 24.04 on both EC2 instances."
+
+  - name: Confirm the controller public key is a single Ed25519 public key
+    ansible.builtin.assert:
+      that:
+      - lookup('ansible.builtin.file', controller_ssh_public_key_file) | trim is match('^ssh-ed25519 ')
+      - (lookup('ansible.builtin.file', controller_ssh_public_key_file) | trim).splitlines() | length == 1
+      fail_msg: "Create ~/.ssh/ansible_ec2.pub on the controller first."
+
+  - name: Ensure the layoutindex group exists
+    ansible.builtin.group:
+      name: "{{ application_group }}"
+      state: present
+
+  - name: Ensure the layoutindex user exists and belongs to sudo
+    ansible.builtin.user:
+      name: "{{ application_user }}"
+      group: "{{ application_group }}"
+      groups: sudo
+      append: true
+      shell: /bin/bash
+      create_home: true
+      password: "!"
+      update_password: on_create
+      state: present
+
+  - name: Read the application user's actual home directory
+    ansible.builtin.getent:
+      database: passwd
+      key: "{{ application_user }}"
+
+  - name: Create the layoutindex SSH directory
+    ansible.builtin.file:
+      path: "{{ ansible_facts['getent_passwd'][application_user][4] }}/.ssh"
+      state: directory
+      owner: "{{ application_user }}"
+      group: "{{ application_group }}"
+      mode: "0700"
+
+  - name: Authorise the controller public key for layoutindex
+    ansible.builtin.lineinfile:
+      path: "{{ ansible_facts['getent_passwd'][application_user][4] }}/.ssh/authorized_keys"
+      line: "{{ lookup('ansible.builtin.file', controller_ssh_public_key_file) | trim }}"
+      create: true
+      owner: "{{ application_user }}"
+      group: "{{ application_group }}"
+      mode: "0600"
+
+  - name: Grant layoutindex passwordless sudo access
+    ansible.builtin.copy:
+      dest: "/etc/sudoers.d/99-{{ application_user }}"
+      content: "{{ application_user }} ALL=(ALL) NOPASSWD: ALL\n"
+      owner: root
+      group: root
+      mode: "0440"
+      validate: /usr/sbin/visudo -cf %s
+
+  - name: Validate the complete sudoers configuration
+    ansible.builtin.command:
+      argv:
+      - /usr/sbin/visudo
+      - -c
+    changed_when: false
+    when: not ansible_check_mode
+
+  tasks:
+  - name: Install base packages and repository prerequisites
+    ansible.builtin.apt:
+      name:
+      - nano
+      - nginx
+      - supervisor
+      - zip
+      - unzip
+      - lsb-release
+      - ca-certificates
+      - apt-transport-https
+      - software-properties-common
+      - python3-apt
+      - python3-debian
+      - gnupg
+      state: present
+      update_cache: true
+      cache_valid_time: 3600
+      lock_timeout: 120
+
+  - name: Inspect the active APT repositories
+    ansible.builtin.command:
+      argv:
+      - apt-cache
+      - policy
+    register: apt_policy
+    changed_when: false
+    check_mode: false
+
+  - name: Configure the Ondrej PHP PPA when it is not already active
+    when:
+    - "'ppa.launchpad.net/ondrej/php/ubuntu' not in apt_policy.stdout"
+    - "'ppa.launchpadcontent.net/ondrej/php/ubuntu' not in apt_policy.stdout"
+    block:
+    - name: Read the PHP PPA signing key fingerprint from Launchpad
+      ansible.builtin.uri:
+        url: https://api.launchpad.net/1.0/~ondrej/+archive/ubuntu/php
+        return_content: true
+        status_code: 200
+        timeout: 30
+      register: php_ppa_metadata
+      changed_when: false
+      check_mode: false
+
+    - name: Verify Launchpad returned a signing key fingerprint
+      ansible.builtin.assert:
+        that:
+        - php_ppa_metadata.json.signing_key_fingerprint | default('', true) is match('^[0-9A-Fa-f]{40}$')
+        fail_msg: "Launchpad did not return a valid PHP PPA signing key fingerprint."
+
+    - name: Add the PHP PPA using deb822 format
+      ansible.builtin.deb822_repository:
+        name: ondrej-php
+        types:
+        - deb
+        uris:
+        - https://ppa.launchpadcontent.net/ondrej/php/ubuntu
+        suites:
+        - "{{ ansible_facts['distribution_release'] }}"
+        components:
+        - main
+        signed_by: "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{{ php_ppa_metadata.json.signing_key_fingerprint }}"
+        enabled: true
+        state: present
+        mode: "0644"
+
+    - name: Refresh APT cache after adding the PHP PPA
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        lock_timeout: 120
+
+  - name: Install PHP 8.5 and the requested extensions
+    ansible.builtin.apt:
+      name:
+      - "php{{ php_version }}"
+      - "php{{ php_version }}-fpm"
+      - "php{{ php_version }}-common"
+      - "php{{ php_version }}-bcmath"
+      - "php{{ php_version }}-mysql"
+      - "php{{ php_version }}-xml"
+      - "php{{ php_version }}-curl"
+      - "php{{ php_version }}-gd"
+      - "php{{ php_version }}-imagick"
+      - "php{{ php_version }}-cli"
+      - "php{{ php_version }}-dev"
+      - "php{{ php_version }}-mbstring"
+      - "php{{ php_version }}-soap"
+      - "php{{ php_version }}-zip"
+      - "php{{ php_version }}-redis"
+      state: present
+      update_cache: true
+      cache_valid_time: 3600
+      lock_timeout: 120
+    notify: Restart PHP FPM
+
+  - name: Configure the PHP FPM pool user group and socket permissions
+    ansible.builtin.lineinfile:
+      path: "{{ php_pool_conf }}"
+      regexp: "{{ item.regexp }}"
+      line: "{{ item.line }}"
+      backup: true
+    loop:
+    - regexp: '^\s*;?\s*user\s*='
+      line: "user = {{ application_user }}"
+    - regexp: '^\s*;?\s*group\s*='
+      line: "group = {{ application_group }}"
+    - regexp: '^\s*;?\s*listen\.owner\s*='
+      line: "listen.owner = {{ application_user }}"
+    - regexp: '^\s*;?\s*listen\.group\s*='
+      line: "listen.group = {{ application_group }}"
+    - regexp: '^\s*;?\s*listen\.mode\s*='
+      line: "listen.mode = 0660"
+    loop_control:
+      label: "{{ item.line }}"
+    notify: Restart PHP FPM
+
+  - name: Configure the Nginx worker user
+    ansible.builtin.lineinfile:
+      path: "{{ nginx_conf }}"
+      regexp: '^\s*user\s+'
+      line: "user {{ application_user }} {{ application_group }};"
+      backup: true
+    notify: Restart Nginx
+
+  - name: Disable the default Nginx site
+    ansible.builtin.file:
+      path: /etc/nginx/sites-enabled/default
+      state: absent
+    notify: Restart Nginx
+
+  - name: Validate PHP FPM configuration before restarting
+    ansible.builtin.command:
+      argv:
+      - "/usr/sbin/php-fpm{{ php_version }}"
+      - -t
+    changed_when: false
+    when: not ansible_check_mode
+
+  - name: Validate Nginx configuration before restarting
+    ansible.builtin.command:
+      argv:
+      - /usr/sbin/nginx
+      - -t
+    changed_when: false
+    when: not ansible_check_mode
+
+  - name: Apply notified restarts after configuration validation
+    ansible.builtin.meta: flush_handlers
+
+  - name: Ensure services are started and enabled at boot
+    ansible.builtin.systemd_service:
+      name: "{{ item }}"
+      state: started
+      enabled: true
+    loop:
+    - "php{{ php_version }}-fpm"
+    - nginx
+    - supervisor
+
+  - name: Verify all three services are active
+    ansible.builtin.command:
+      argv:
+      - systemctl
+      - is-active
+      - "php{{ php_version }}-fpm"
+      - nginx
+      - supervisor
+    changed_when: false
+    when: not ansible_check_mode
+
+  handlers:
+  - name: Restart PHP FPM
+    ansible.builtin.systemd_service:
+      name: "php{{ php_version }}-fpm"
+      state: restarted
+
+  - name: Restart Nginx
+    ansible.builtin.systemd_service:
+      name: nginx
+      state: restarted
